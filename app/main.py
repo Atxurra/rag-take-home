@@ -8,6 +8,7 @@ from langfuse import Langfuse
 from contextlib import asynccontextmanager
 
 from .rag_service import RAGService
+from .schemas import QueryRequest, QueryResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,10 +22,12 @@ langfuse = Langfuse(
 
 pdf_dir = "/app/docs"
 
+ANSWER_MODE = os.getenv("ANSWER_MODE", "strict")
 
 rag_service = RAGService(
     pdf_paths=[os.path.join(pdf_dir, f) for f in os.listdir(pdf_dir) if f.endswith(".pdf")],
-    langfuse=langfuse
+    langfuse=langfuse,
+    answer_mode=ANSWER_MODE
 )
 
 @asynccontextmanager
@@ -70,3 +73,17 @@ async def ingest_documents():
         logger.error(f"Ingestion failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
     
+@app.post("/query", response_model=QueryResponse)
+async def query_documents(request: QueryRequest):
+    """
+    Endpoint to answer user questions using the RAG pipeline.
+    Accepts a question and returns an answer with supporting sources.
+    """
+    logger.info(f"Query endpoint called with question: {request.question}")
+    try:
+        result = await rag_service.query(request.question)
+        logger.info("Query processed successfully")
+        return QueryResponse(**result)
+    except Exception as e:
+        logger.error(f"Query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")

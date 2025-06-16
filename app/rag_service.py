@@ -3,9 +3,14 @@ from typing import List
 from datetime import datetime
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbedding
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chains import RetrievalQA
 from langfuse import Langfuse
+from langchain_core.messages import SystemMessage, HumanMessage
+import tiktoken
+from .prompt_templates import STRICT_PROMPT, FLEXIBLE_PROMPT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -18,7 +23,8 @@ class RAGService:
     def __init__(
         self,
         pdf_paths: List[str],
-        langfuse: Langfuse
+        langfuse: Langfuse,
+        answer_mode: str = "strict"
     ):
         """
         Initialize the RAGService.
@@ -30,6 +36,7 @@ class RAGService:
         """
         self.pdf_paths = pdf_paths
         self.langfuse = langfuse
+        self.answer_mode = answer_mode
         self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         self.embeddings = OpenAIEmbeddings()
         self.vector_store = None
@@ -95,3 +102,94 @@ class RAGService:
                 raise
             finally:
                 pass
+    
+    async def query(self, question: str):
+        """
+        Answers a user question using the RAG pipeline.
+        Performs similarity search, synthesizes an answer with an LLM, and returns the answer with supporting sources.
+        All steps are traced with Langfuse.
+
+        Args:
+            question (str): The user's question.
+        Returns:
+            dict: Dictionary with 'answer' and 'sources' (list of book/page/text dicts).
+        """
+        if not self.vector_store:
+            raise Exception("Vector store not initialized. Please ingest documents first.")
+        
+        # Start only one query_documents span per query
+        with self.langfuse.start_as_current_span(name="query_documents") as root_span:
+            try:
+                with self.langfuse.start_as_current_span(name="similarity_search") as sim_span:
+                    logger.info("Performing similarity search")
+                    results = self.vector_store.similarity_search(question, k=3)
+                    sim_span.update(
+                        input=question,
+                        output=[{
+                            "book": doc.metadata.get("source", "Unknown"),
+                            "page": doc.metadata.get("page", "N/A"),
+                            "text": doc.page_content
+                        } for doc in results]
+                    )
+
+                formatted_context = "\n".join([
+                    f"[{doc.metadata.get('source', 'Unknown')}, page {doc.metadata.get('page', 'N/A')}]: {doc.page_content}"
+                    for doc in results
+                ])
+
+                with self.langfuse.start_as_current_span(name="llm_response") as llm_span:
+                    logger.info("Generating answer using LLM")
+                    retriever = self.vector_store.as_retriever(search_kwargs={"k": 3})
+                    llm = ChatOpenAI(temperature=0)
+                    if self.answer_mode == "strict":
+                        prompt_template = PromptTemplate(
+                            input_variables=["context", "question"],
+                            template=STRICT_PROMPT
+                        )
+                    else:
+                        prompt_template = PromptTemplate(
+                            input_variables=["context", "question"],
+                            template=FLEXIBLE_PROMPT
+                        )
+                    qa_chain = RetrievalQA.from_chain_type(
+                        llm=llm,
+                        retriever=retriever,
+                        return_source_documents=True,
+                        chain_type_kwargs={"prompt": prompt_template}
+                    )
+                    prompt_text = prompt_template.format(context=formatted_context, question=question)
+                    model_name = llm.model_name or "unknown"
+                    response = qa_chain({"context": formatted_context, "query": question})
+                    answer = response["result"]
+                    source_docs = response["source_documents"]
+                    # Token usage (may not be visible in Langfuse UI)
+                    input_tokens = llm.get_num_tokens(prompt_text)
+                    output_tokens = llm.get_num_tokens(answer)
+                    llm_span.update(
+                        input={"context": formatted_context, "question": question},
+                        output=answer,
+                        model=model_name,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens
+                    )
+
+                sources = []
+                for doc in source_docs:
+                    sources.append({
+                        "book": doc.metadata.get("source", "Unknown"),
+                        "page": doc.metadata.get("page", None),
+                        "text": doc.page_content
+                    })
+
+                root_span.update(
+                    output={"answer": answer, "sources": sources}
+                )
+                return {"answer": answer, "sources": sources}
+
+            except Exception as e:
+                logger.error(f"Query error: {str(e)}")
+                root_span.update(
+                    output={"error": str(e)},
+                    level="ERROR"
+                )
+                raise

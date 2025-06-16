@@ -1,4 +1,3 @@
-version: '3.9'
 services:
   rag-service:
     build: .
@@ -9,5 +8,6 @@ services:
       - LANGFUSE_SECRET_KEY
       - LANGFUSE_PUBLIC_KEY
       - LANGFUSE_HOST
+      - ANSWER_MODE
     volumes:
       - .:/app
